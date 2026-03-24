@@ -18,6 +18,35 @@ const transporter = nodemailer.createTransport({
   tls   : { rejectUnauthorized: false },
 });
 
+// ── Log dans emails_queue ─────────────────────────────────────
+async function logEmail({ recipient, subject, status, error_message }) {
+  try {
+    const res = await fetch(process.env.SUPABASE_URL + "/rest/v1/emails_queue", {
+      method : "POST",
+      headers: {
+        "apikey"       : process.env.SUPABASE_KEY,
+        "Authorization": "Bearer " + process.env.SUPABASE_KEY,
+        "Content-Type" : "application/json",
+        "Prefer"       : "return=minimal",
+      },
+      body: JSON.stringify({
+        recipient,
+        subject,
+        body        : "(html)",
+        status,
+        ...(status === "sent" ? { sent_at: new Date().toISOString() } : {}),
+        ...(error_message     ? { error_message }                     : {}),
+      }),
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      console.error("[PAPSA-MAILER] Log Supabase HTTP", res.status, txt);
+    }
+  } catch (e) {
+    console.error("[PAPSA-MAILER] Log Supabase échoué :", e.message);
+  }
+}
+
 const CORS = {
   "Access-Control-Allow-Origin" : "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -39,8 +68,8 @@ export async function POST(req) {
   }
 
   let messages;
-  if (Array.isArray(data.messages))              messages = data.messages;
-  else if (data.to && data.subject && data.html) messages = [data];
+  if (Array.isArray(data.messages))               messages = data.messages;
+  else if (data.to && data.subject && data.html)  messages = [data];
   else return NextResponse.json({ ok: false, error: "Missing: to/subject/html" }, { status: 400, headers: CORS });
 
   messages = messages.filter(m => m?.to && m?.subject && m?.html);
@@ -50,6 +79,7 @@ export async function POST(req) {
   const FROM_NAME = process.env.SMTP_FROM_NAME || "PAPSA — Demandes & Réclamations";
   let sent = 0;
   const errors = [];
+  const tasks  = [];
 
   for (const msg of messages) {
     const toList = Array.isArray(msg.to)
@@ -58,20 +88,34 @@ export async function POST(req) {
     const ccList = Array.isArray(msg.cc) ? msg.cc.filter(e => e?.includes("@")) : [];
 
     for (const addr of toList) {
-      try {
-        await transporter.sendMail({
-          from: `"${FROM_NAME}" <${FROM_ADDR}>`,
-          to: addr, subject: msg.subject, html: msg.html,
-          ...(ccList.length ? { cc: ccList.join(", ") } : {}),
-        });
-        sent++;
-        console.log(`[PAPSA-MAILER] ✅ → ${addr}`);
-      } catch(err) {
-        errors.push(`${addr}: ${err.message}`);
-        console.error(`[PAPSA-MAILER] ❌ ${addr}: ${err.message}`);
+      if (!addr || !addr.includes("@")) {
+        errors.push(`${addr}: adresse invalide`);
+        tasks.push(logEmail({ recipient: addr, subject: msg.subject, status: "failed", error_message: "Adresse invalide" }));
+        continue;
       }
+
+      tasks.push(
+        transporter.sendMail({
+          from: `"${FROM_NAME}" <${FROM_ADDR}>`,
+          to  : addr,
+          subject: msg.subject,
+          html   : msg.html,
+          ...(ccList.length ? { cc: ccList.join(", ") } : {}),
+        })
+        .then(async () => {
+          sent++;
+          console.log(`[PAPSA-MAILER] ✅ → ${addr}`);
+          await logEmail({ recipient: addr, subject: msg.subject, status: "sent" });
+        })
+        .catch(async (err) => {
+          errors.push(`${addr}: ${err.message}`);
+          console.error(`[PAPSA-MAILER] ❌ ${addr}: ${err.message}`);
+          await logEmail({ recipient: addr, subject: msg.subject, status: "failed", error_message: err.message });
+        })
+      );
     }
   }
 
+  await Promise.allSettled(tasks);
   return NextResponse.json({ ok: true, sent, errors }, { headers: CORS });
 }
